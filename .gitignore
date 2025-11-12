@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Local data & outputs
+data/
+!data/.gitkeep
+
+# Live configs (keep only samples in git)
+configs/*.yml
+!configs/*.sample
+
+# Logs, temp
+*.log
+*.tmp
+*.sqlite
+
+# Node/web extras (if added later)
+webui/node_modules/

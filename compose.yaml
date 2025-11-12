@@ -1,0 +1,18 @@
+services:
+  m3u-merge:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: m3u-merge:latest
+    container_name: m3u-merge
+    ports:
+      - "8188:8188"
+    environment:
+      - CONFIG_DIR=/configs
+      - DATA_DIR=/data
+      - TZ=America/Chicago
+      - MODE=webui
+    volumes:
+      - ./configs:/configs
+      - ./data:/data
+    restart: unless-stopped
