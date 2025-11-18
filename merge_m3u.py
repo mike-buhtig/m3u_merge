@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-do_stuff.py  –  end-to-end M3U + EPG update/merge
+merge_m3u.py  –  end-to-end M3U + EPG update/merge
 
 Usage (from ~/m3u_merge):
 
-    PYTHONPATH=src python3 do_stuff.py
+    PYTHONPATH=src python3 merge_m3u.py
 """
 
 from pathlib import Path
@@ -25,7 +25,30 @@ OUTPUT_DIR   = Path("/var/www/epg")
 
 MERGED_EPG   = OUTPUT_DIR / "merged_epg.xml"
 MERGED_M3U   = OUTPUT_DIR / "merged.m3u"
+DEBUG_DIR        = OUTPUT_DIR
+DEBUG_PARSED     = DEBUG_DIR / "debug_step3_parsed_samsung.txt"
+DEBUG_MAPPED     = DEBUG_DIR / "debug_step3_mapped_samsung.txt"
+DEBUG_FINAL      = DEBUG_DIR / "debug_step3_final_samsung.txt"
 
+
+def _debug_reset_files():
+    """Remove old debug files so each run is clean."""
+    for p in (DEBUG_PARSED, DEBUG_MAPPED, DEBUG_FINAL):
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+
+def _debug_append(path: Path, text: str):
+    """Append a single line (plus newline) to the given debug file."""
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        # Silent fail – this is debug-only.
+        pass
 
 def step1_fetch():
     print("=== STEP 1: Fetching all providers into cache ===")
@@ -67,7 +90,7 @@ def step2_merge_epg():
     print(f"  Total <channel> elements in merged EPG: {epg_channel_count}")
 
 
-def step3_merge_m3u():
+"""def step3_merge_m3u():
     print("=== STEP 3: Merging provider M3Us with sorted numbering ===")
     cfg = load_config(CONFIG_PATH)
 
@@ -152,7 +175,131 @@ def step3_merge_m3u():
     for name, count in sorted(prov_counts.items()):
         print(f"    {name}: {count}")
     print(f"  Total channels written: {sum(prov_counts.values())}")
+    print(f"  Final channel number used: {current_chno - 1}")"""
+    
+    
+def step3_merge_m3u():
+    print("=== STEP 3: Merging provider M3Us with sorted numbering ===")
+    cfg = load_config(CONFIG_PATH)
+
+    # Reset debug files at the start of each run
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    _debug_reset_files()
+
+    # Collect ALL channels first, then sort, then number.
+    channels = []
+
+    for p in cfg.providers:
+        prov_name = p.name.strip() or p.slug   # e.g. "Samsung", "Pluto", "Plex"
+        slug = p.slug
+
+        for m3u_url in p.m3u_urls:
+            m3u_path = _cache_filename("m3u", slug, m3u_url, DATA_DIR)
+            if not m3u_path.exists():
+                continue
+
+            print(f"  Reading M3U from: {m3u_path} ({prov_name})")
+
+            for ch in read_m3u(m3u_path):
+                # Raw parsed values straight from read_m3u()
+                tvg_id_raw      = (ch.tvg_id or "").strip()
+                tvg_name_raw    = (ch.tvg_name or "").strip()
+                name_raw        = (ch.name or "").strip()
+                group_raw       = (ch.group_title or "").strip()
+                url_raw         = (ch.url or "").strip()
+
+                # DEBUG 1: Log how Samsung channels look *immediately* after parse
+                if "samsung" in slug.lower() or "samsung" in prov_name.lower():
+                    _debug_append(
+                        DEBUG_PARSED,
+                        f"[PARSED] slug={slug!r}, prov={prov_name!r}, "
+                        f"tvg-id={tvg_id_raw!r}, tvg-name={tvg_name_raw!r}, "
+                        f"name={name_raw!r}, group-title={group_raw!r}, url={url_raw!r}"
+                    )
+
+                # Our existing mapping logic
+                tvg_id      = tvg_id_raw
+                tvg_name    = (tvg_name_raw or name_raw or "").strip()
+                display_raw = (name_raw or tvg_name or tvg_id or url_raw).strip()
+                group       = group_raw
+                url         = url_raw
+
+                # DEBUG 2: Log the mapped fields that will be used in sorting/numbering
+                if "samsung" in slug.lower() or "samsung" in prov_name.lower():
+                    _debug_append(
+                        DEBUG_MAPPED,
+                        f"[MAPPED] slug={slug!r}, prov={prov_name!r}, "
+                        f"display_raw={display_raw!r}, tvg-id={tvg_id!r}, "
+                        f"tvg-name={tvg_name!r}, group={group!r}, url={url!r}"
+                    )
+
+                channels.append({
+                    "prov_name":  prov_name,
+                    "slug":       slug,
+                    "tvg_id":     tvg_id,
+                    "tvg_name":   tvg_name,
+                    "display_raw": display_raw,
+                    "group":      group,
+                    "url":        url,
+                })
+
+    # --- Sort BEFORE numbering ---
+    channels.sort(
+        key=lambda c: (c["display_raw"].lower(), c["prov_name"].lower())
+    )
+
+    # --- Now assign channel numbers from 100 upwards in that sorted order ---
+    lines = []
+    lines.append(f'#EXTM3U x-tvg-url="http://epg.mikefarris.biz/{MERGED_EPG.name}"')
+
+    prov_counts = Counter()
+    current_chno = 100
+
+    for c in channels:
+        prov_name   = c["prov_name"]
+        tvg_id      = c["tvg_id"]
+        tvg_name    = c["tvg_name"]
+        display_raw = c["display_raw"]
+        group       = c["group"]
+        url         = c["url"]
+
+        visible_name = f"{display_raw} ({prov_name})"
+        prov_counts[prov_name] += 1
+
+        chno = current_chno
+        current_chno += 1
+
+        # We IGNORE any upstream tvg-chno, and only set our own.
+        extinf = '#EXTINF:-1'
+        if tvg_id:
+            extinf += f' tvg-id="{tvg_id}"'
+        if tvg_name:
+            extinf += f' tvg-name="{tvg_name}"'
+        if group:
+            extinf += f' group-title="{group}"'
+        extinf += f' tvg-chno="{chno}"'
+        extinf += f',{visible_name}'
+
+        lines.append(extinf)
+        lines.append(url)
+
+        # DEBUG 3: See exactly what we *actually* wrote for Samsung channels
+        if "samsung" in c["slug"].lower() or "samsung" in prov_name.lower():
+            _debug_append(
+                DEBUG_FINAL,
+                f"[FINAL] {extinf}\n[URL]   {url}"
+            )
+
+    with MERGED_M3U.open("w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+
+    print(f"  Wrote merged M3U with provider tags to {MERGED_M3U}")
+    print("  Per-provider channel counts:")
+    for name, count in sorted(prov_counts.items()):
+        print(f"    {name}: {count}")
+    print(f"  Total channels written: {sum(prov_counts.values())}")
     print(f"  Final channel number used: {current_chno - 1}")
+
 
 
 def main():

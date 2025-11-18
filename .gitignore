@@ -7,6 +7,8 @@ __pycache__/
 # Local data & outputs
 data/
 !data/.gitkeep
+versions
+
 
 # Live configs (keep only samples in git)
 configs/*.yml

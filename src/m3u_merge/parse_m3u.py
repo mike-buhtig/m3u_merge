@@ -17,12 +17,16 @@ class M3UChannel:
 def _parse_extinf_attrs(attr_str: str) -> Dict[str, str]:
     """
     Parse key="value" pairs from the EXTINF attribute section.
-    This is intentionally simple but works for:
+
+    Works for things like:
       tvg-id="..."
       channel-id="..."
       tvg-name="..."
       tvc-guide-title="..."
-      group-title="..."
+      group-title="Nature, History & Science"
+      tvg-chno="2905"
+
+    Commas inside quoted values are preserved (e.g. group-title="A, B & C").
     """
     attrs: Dict[str, str] = {}
     key: Optional[str] = None
@@ -32,22 +36,29 @@ def _parse_extinf_attrs(attr_str: str) -> Dict[str, str]:
     i = 0
     while i < len(attr_str):
         ch = attr_str[i]
+
         if ch == '"':
+            # Toggle quote state
             in_quotes = not in_quotes
+
+            # Closing quote: commit value to current key
             if not in_quotes and key is not None:
-                attrs[key] = "".join(buf)
+                value = "".join(buf)
+                attrs[key.strip()] = value
                 key = None
                 buf = []
+
             i += 1
             continue
 
         if not in_quotes and ch.isspace():
+            # Whitespace between attributes when not in quotes
             i += 1
             continue
 
         if not in_quotes and ch == "=" and key is None:
-            # what we have in buf so far is the key
-            key = "".join(buf)
+            # Everything accumulated so far is the key
+            key = "".join(buf).strip()
             buf = []
             i += 1
             continue
@@ -56,6 +67,36 @@ def _parse_extinf_attrs(attr_str: str) -> Dict[str, str]:
         i += 1
 
     return attrs
+
+
+def _split_extinf_line(line: str) -> tuple[str, str]:
+    """
+    Split an #EXTINF line into (header, name) while respecting quoted commas.
+
+    Example:
+      '#EXTINF:-1 tvg-id="US130000639" group-title="Nature, History & Science" tvg-chno="2905",PBS Genealogy'
+
+    Should become:
+      header = '#EXTINF:-1 tvg-id="US130000639" group-title="Nature, History & Science" tvg-chno="2905"'
+      name   = 'PBS Genealogy'
+    """
+    in_quotes = False
+    comma_idx: Optional[int] = None
+
+    for i, ch in enumerate(line):
+        if ch == '"':
+            in_quotes = not in_quotes
+        elif ch == "," and not in_quotes:
+            comma_idx = i
+            break
+
+    if comma_idx is None:
+        # No comma found (very unusual, but be defensive)
+        return line, ""
+
+    header = line[:comma_idx]
+    name = line[comma_idx + 1 :]
+    return header, name
 
 
 def read_m3u(path: Path) -> Iterator[M3UChannel]:
@@ -69,6 +110,14 @@ def read_m3u(path: Path) -> Iterator[M3UChannel]:
       - Uses tvg-id if present, otherwise channel-id as tvg_id.
       - Uses tvg-name, or tvc-guide-title, or the display name as tvg_name.
       - Keeps group-title and the raw attrs in case we need them later.
+
+    Important fix:
+      We now split the #EXTINF line on the first comma that is NOT inside
+      double quotes, so values like:
+
+        group-title="Nature, History & Science"
+
+      are parsed correctly without mangling the channel name.
     """
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         last_attrs: Dict[str, str] | None = None
@@ -85,11 +134,10 @@ def read_m3u(path: Path) -> Iterator[M3UChannel]:
 
             # metadata for next channel
             if line.startswith("#EXTINF:"):
-                try:
-                    header, name = line.split(",", 1)
-                except ValueError:
-                    header, name = line, ""
+                header, name = _split_extinf_line(line)
 
+                # header is something like:
+                #   '#EXTINF:-1 tvg-id="..." group-title="..." tvg-chno="..."'
                 parts = header.split(" ", 1)
                 attr_str = parts[1] if len(parts) > 1 else ""
                 attrs = _parse_extinf_attrs(attr_str)
@@ -127,3 +175,4 @@ def read_m3u(path: Path) -> Iterator[M3UChannel]:
             # reset for next channel
             last_attrs = None
             last_name = None
+
