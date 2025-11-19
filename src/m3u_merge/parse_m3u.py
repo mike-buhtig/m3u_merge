@@ -17,16 +17,12 @@ class M3UChannel:
 def _parse_extinf_attrs(attr_str: str) -> Dict[str, str]:
     """
     Parse key="value" pairs from the EXTINF attribute section.
-
-    Works for things like:
+    This is intentionally simple but works for:
       tvg-id="..."
       channel-id="..."
       tvg-name="..."
       tvc-guide-title="..."
-      group-title="Nature, History & Science"
-      tvg-chno="2905"
-
-    Commas inside quoted values are preserved (e.g. group-title="A, B & C").
+      group-title="..."
     """
     attrs: Dict[str, str] = {}
     key: Optional[str] = None
@@ -36,29 +32,22 @@ def _parse_extinf_attrs(attr_str: str) -> Dict[str, str]:
     i = 0
     while i < len(attr_str):
         ch = attr_str[i]
-
         if ch == '"':
-            # Toggle quote state
             in_quotes = not in_quotes
-
-            # Closing quote: commit value to current key
             if not in_quotes and key is not None:
-                value = "".join(buf)
-                attrs[key.strip()] = value
+                attrs[key] = "".join(buf)
                 key = None
                 buf = []
-
             i += 1
             continue
 
         if not in_quotes and ch.isspace():
-            # Whitespace between attributes when not in quotes
             i += 1
             continue
 
         if not in_quotes and ch == "=" and key is None:
-            # Everything accumulated so far is the key
-            key = "".join(buf).strip()
+            # what we have in buf so far is the key
+            key = "".join(buf)
             buf = []
             i += 1
             continue
@@ -69,34 +58,61 @@ def _parse_extinf_attrs(attr_str: str) -> Dict[str, str]:
     return attrs
 
 
-def _split_extinf_line(line: str) -> tuple[str, str]:
+def _normalize_group_title(group: Optional[str]) -> Optional[str]:
     """
-    Split an #EXTINF line into (header, name) while respecting quoted commas.
+    Normalize provider group titles:
 
-    Example:
-      '#EXTINF:-1 tvg-id="US130000639" group-title="Nature, History & Science" tvg-chno="2905",PBS Genealogy'
+      - Trim whitespace
+      - Fix common UTF-8 -> Latin-1 mojibake ("En EspaÃ±ol" -> "En Español")
+      - Normalize " X + Y " to " X & Y " (but leave 'Anime+' etc. alone)
+      - Collapse multiple spaces
 
-    Should become:
-      header = '#EXTINF:-1 tvg-id="US130000639" group-title="Nature, History & Science" tvg-chno="2905"'
-      name   = 'PBS Genealogy'
+    We *do not* currently:
+      - Split on ';' (e.g. 'Black Entertainment;Pop Culture') – you explicitly
+        asked to keep this as-is for now.
     """
-    in_quotes = False
-    comma_idx: Optional[int] = None
+    if not group:
+        return None
 
-    for i, ch in enumerate(line):
-        if ch == '"':
-            in_quotes = not in_quotes
-        elif ch == "," and not in_quotes:
-            comma_idx = i
-            break
+    g = group.strip()
+    if not g:
+        return None
 
-    if comma_idx is None:
-        # No comma found (very unusual, but be defensive)
-        return line, ""
+    # --- Fix mojibake like "EspaÃ±ol" -> "Español" when it really is
+    # UTF-8 bytes mis-decoded as latin1.
+    #
+    # We only even try this when we see the 'Ã' artifact, to avoid
+    # messing with already-correct text.
+    if "Ã" in g:
+        try:
+            # Typical mojibake path: original UTF-8 bytes were interpreted
+            # as Latin-1 and turned into "Ã±", etc. Re-encode as Latin-1
+            # and decode as UTF-8 to reverse that.
+            fixed = g.encode("latin-1").decode("utf-8")
 
-    header = line[:comma_idx]
-    name = line[comma_idx + 1 :]
-    return header, name
+            # Only accept it if it actually removed the 'Ã' garbage.
+            if "Ã" not in fixed:
+                g = fixed
+        except UnicodeError:
+            # If this isn't actually that kind of mojibake, keep original.
+            pass
+
+    # --- Normalize " X + Y " -> " X & Y "
+    # This does NOT touch 'Anime+' because there are no spaces around '+'.
+    g = g.replace(" + ", " & ")
+
+    # NOTE: You explicitly asked *not* to treat ';' as a separator yet.
+    # Leaving this commented for possible future use:
+    #
+    # if ";" in g:
+    #     parts = [p.strip() for p in g.split(";") if p.strip()]
+    #     if parts:
+    #         g = parts[0]
+
+    # --- Collapse multiple spaces to a single space
+    g = " ".join(g.split())
+
+    return g or None
 
 
 def read_m3u(path: Path) -> Iterator[M3UChannel]:
@@ -110,14 +126,6 @@ def read_m3u(path: Path) -> Iterator[M3UChannel]:
       - Uses tvg-id if present, otherwise channel-id as tvg_id.
       - Uses tvg-name, or tvc-guide-title, or the display name as tvg_name.
       - Keeps group-title and the raw attrs in case we need them later.
-
-    Important fix:
-      We now split the #EXTINF line on the first comma that is NOT inside
-      double quotes, so values like:
-
-        group-title="Nature, History & Science"
-
-      are parsed correctly without mangling the channel name.
     """
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         last_attrs: Dict[str, str] | None = None
@@ -134,10 +142,11 @@ def read_m3u(path: Path) -> Iterator[M3UChannel]:
 
             # metadata for next channel
             if line.startswith("#EXTINF:"):
-                header, name = _split_extinf_line(line)
+                try:
+                    header, name = line.split(",", 1)
+                except ValueError:
+                    header, name = line, ""
 
-                # header is something like:
-                #   '#EXTINF:-1 tvg-id="..." group-title="..." tvg-chno="..."'
                 parts = header.split(" ", 1)
                 attr_str = parts[1] if len(parts) > 1 else ""
                 attrs = _parse_extinf_attrs(attr_str)
@@ -161,7 +170,10 @@ def read_m3u(path: Path) -> Iterator[M3UChannel]:
                 or attrs.get("tvc-guide-title")
                 or name
             )
-            group_title = attrs.get("group-title")
+
+            # Apply normalization *only* to group-title (for now).
+            group_title_raw = attrs.get("group-title")
+            group_title = _normalize_group_title(group_title_raw)
 
             yield M3UChannel(
                 name=name,
@@ -175,4 +187,3 @@ def read_m3u(path: Path) -> Iterator[M3UChannel]:
             # reset for next channel
             last_attrs = None
             last_name = None
-
