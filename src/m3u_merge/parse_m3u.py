@@ -1,7 +1,9 @@
 from __future__ import annotations
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, Optional
+# parse_m3u.py version 1.0.6
 
 
 @dataclass
@@ -17,12 +19,6 @@ class M3UChannel:
 def _parse_extinf_attrs(attr_str: str) -> Dict[str, str]:
     """
     Parse key="value" pairs from the EXTINF attribute section.
-    This is intentionally simple but works for:
-      tvg-id="..."
-      channel-id="..."
-      tvg-name="..."
-      tvc-guide-title="..."
-      group-title="..."
     """
     attrs: Dict[str, str] = {}
     key: Optional[str] = None
@@ -32,9 +28,11 @@ def _parse_extinf_attrs(attr_str: str) -> Dict[str, str]:
     i = 0
     while i < len(attr_str):
         ch = attr_str[i]
+
         if ch == '"':
             in_quotes = not in_quotes
             if not in_quotes and key is not None:
+                # closing quote: commit the current buffer as value
                 attrs[key] = "".join(buf)
                 key = None
                 buf = []
@@ -60,72 +58,76 @@ def _parse_extinf_attrs(attr_str: str) -> Dict[str, str]:
 
 def _normalize_group_title(group: Optional[str]) -> Optional[str]:
     """
-    Normalize provider group titles:
-
-      - Trim whitespace
-      - Fix common UTF-8 -> Latin-1 mojibake ("En EspaÃ±ol" -> "En Español")
-      - Normalize " X + Y " to " X & Y " (but leave 'Anime+' etc. alone)
-      - Collapse multiple spaces
-
-    We *do not* currently:
-      - Split on ';' (e.g. 'Black Entertainment;Pop Culture') – you explicitly
-        asked to keep this as-is for now.
+    Normalize group-title strings.
     """
     if not group:
-        return None
+        return group
 
     g = group.strip()
-    if not g:
-        return None
 
-    # --- Fix mojibake like "EspaÃ±ol" -> "Español" when it really is
-    # UTF-8 bytes mis-decoded as latin1.
-    #
-    # We only even try this when we see the 'Ã' artifact, to avoid
-    # messing with already-correct text.
-    if "Ã" in g:
+    # --- Fix typical UTF-8-as-Latin1 mojibake ---
+    if "Ã" in g or "Â" in g:
         try:
-            # Typical mojibake path: original UTF-8 bytes were interpreted
-            # as Latin-1 and turned into "Ã±", etc. Re-encode as Latin-1
-            # and decode as UTF-8 to reverse that.
-            fixed = g.encode("latin-1").decode("utf-8")
-
-            # Only accept it if it actually removed the 'Ã' garbage.
-            if "Ã" not in fixed:
-                g = fixed
+            g = g.encode("latin1").decode("utf-8")
         except UnicodeError:
-            # If this isn't actually that kind of mojibake, keep original.
             pass
 
-    # --- Normalize " X + Y " -> " X & Y "
-    # This does NOT touch 'Anime+' because there are no spaces around '+'.
+    # --- Normalize " + " to " & " ---
     g = g.replace(" + ", " & ")
 
-    # NOTE: You explicitly asked *not* to treat ';' as a separator yet.
-    # Leaving this commented for possible future use:
-    #
-    # if ";" in g:
-    #     parts = [p.strip() for p in g.split(";") if p.strip()]
-    #     if parts:
-    #         g = parts[0]
-
-    # --- Collapse multiple spaces to a single space
+    # --- Collapse multiple spaces ---
     g = " ".join(g.split())
 
     return g or None
 
 
+def _split_extinf_line(line: str) -> tuple[str, str]:
+    """
+    Safely splits an #EXTINF line into (attributes, name).
+    It looks for the first comma that is NOT inside quotes.
+    """
+    # Strip '#EXTINF:' prefix if present
+    if line.startswith("#EXTINF:"):
+        # Skip the tag itself
+        start_idx = 8
+    else:
+        start_idx = 0
+
+    in_quotes = False
+    split_index = -1
+
+    # Scan the string starting after #EXTINF:
+    for i in range(start_idx, len(line)):
+        ch = line[i]
+
+        if ch == '"':
+            in_quotes = not in_quotes
+        
+        # Found the separator comma?
+        if ch == ',' and not in_quotes:
+            split_index = i
+            break
+    
+    if split_index != -1:
+        # Everything before comma (minus #EXTINF:) is metadata
+        # Everything after is the channel name
+        # We slice from 0 to keep original indices aligned conceptually, 
+        # but effectively we want header part vs name part.
+        
+        # If there was an #EXTINF prefix, we might want to remove the duration logic here?
+        # Actually, easiest is just to return the raw chunks.
+        
+        header_part = line[:split_index] # Contains "#EXTINF:-1 tvg-id..."
+        name_part = line[split_index+1:] # Contains "My Channel Name"
+        return header_part, name_part
+    else:
+        # No comma found? Treat whole thing as header (weird) or empty name
+        return line, ""
+
+
 def read_m3u(path: Path) -> Iterator[M3UChannel]:
     """
-    Simple EXTINF parser:
-
-      - Ignores #EXTM3U and other comment lines except #EXTINF.
-      - For each #EXTINF line, the very next non-comment, non-empty line
-        is treated as the stream URL.
-
-      - Uses tvg-id if present, otherwise channel-id as tvg_id.
-      - Uses tvg-name, or tvc-guide-title, or the display name as tvg_name.
-      - Keeps group-title and the raw attrs in case we need them later.
+    Parses M3U using a robust char-by-char splitter to handle commas in attributes.
     """
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         last_attrs: Dict[str, str] | None = None
@@ -136,30 +138,51 @@ def read_m3u(path: Path) -> Iterator[M3UChannel]:
             if not line:
                 continue
 
-            # header
             if line.startswith("#EXTM3U"):
                 continue
 
-            # metadata for next channel
             if line.startswith("#EXTINF:"):
-                try:
-                    header, name = line.split(",", 1)
-                except ValueError:
-                    header, name = line, ""
+                # === ROBUST SPLIT ===
+                # We manually split at the first comma that isn't quoted.
+                header_raw, name = _split_extinf_line(line)
+                
+                # header_raw looks like: "#EXTINF:-1 tvg-id="x""
+                # We need to isolate the attributes. 
+                # Usually distinct from duration by a space.
+                
+                # Remove "#EXTINF:" prefix for processing
+                clean_header = header_raw.replace("#EXTINF:", "", 1).strip()
+                
+                # Attempt to separate duration from attributes. 
+                # Duration is usually the first token (e.g. -1 or 0).
+                # We look for the first space.
+                parts = clean_header.split(" ", 1)
+                
+                if len(parts) > 1:
+                    # parts[0] is duration, parts[1] is attr string
+                    attr_str = parts[1]
+                else:
+                    # No space found? Could be "#EXTINF:-1" with no attrs
+                    # Or weirdly formatted. Assume no attrs if no space separator.
+                    attr_str = ""
 
-                parts = header.split(" ", 1)
-                attr_str = parts[1] if len(parts) > 1 else ""
                 attrs = _parse_extinf_attrs(attr_str)
+
+                # --- DEBUGGING (Optional: Uncomment if a specific group still fails) ---
+                # if "News, Weather" in raw:
+                #     print(f"DEBUG: Found line: {line}")
+                #     print(f"DEBUG: Split Name: {name}")
+                #     print(f"DEBUG: Attr Str:   {attr_str}")
+                #     print(f"DEBUG: Parsed:     {attrs}")
+                # ---------------------------------------------------------------------
 
                 last_attrs = attrs
                 last_name = name.strip()
                 continue
 
-            # other comment lines
             if line.startswith("#"):
                 continue
 
-            # this should be the URL for the last EXTINF
             url = line
             attrs = last_attrs or {}
             name = (last_name or "").strip()
@@ -171,9 +194,8 @@ def read_m3u(path: Path) -> Iterator[M3UChannel]:
                 or name
             )
 
-            # Apply normalization *only* to group-title (for now).
-            group_title_raw = attrs.get("group-title")
-            group_title = _normalize_group_title(group_title_raw)
+            raw_group = attrs.get("group-title")
+            group_title = _normalize_group_title(raw_group)
 
             yield M3UChannel(
                 name=name,
@@ -184,6 +206,5 @@ def read_m3u(path: Path) -> Iterator[M3UChannel]:
                 raw_attrs=attrs or None,
             )
 
-            # reset for next channel
             last_attrs = None
             last_name = None
